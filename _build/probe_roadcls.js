@@ -1,7 +1,5 @@
 /* 机位所在道路的等级/宽度，以及路网按 cls 的里程分布（决定家具做在哪一级路上） */
-const { chromium } = require('C:/Users/靳中轩/.workbuddy/binaries/node/workspace/node_modules/playwright-core');
-const ROOT = 'C:/Users/靳中轩/Desktop/neon-changsha';
-const EXE = 'C:/Users/靳中轩/AppData/Local/ms-playwright/chromium_headless_shell-1194/chrome-win/headless_shell.exe';
+const { chromium, ROOT, EXE } = require('./_pw');
 
 (async () => {
   const browser = await chromium.launch({

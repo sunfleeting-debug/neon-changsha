@@ -1,9 +1,7 @@
 /* 高亮验收：同一栋楼在 190 / 450 / 950m 三个距离下，选中轮廓是否都看得清。
    远距离是这个功能的真正难点 —— 楼在 700m 外只有几十像素高，一圈线几乎等于没有。 */
-const { chromium } = require('C:/Users/靳中轩/.workbuddy/binaries/node/workspace/node_modules/playwright-core');
+const { chromium, ROOT, EXE } = require('./_pw');
 const fs = require('fs');
-const ROOT = 'C:/Users/靳中轩/Desktop/neon-changsha';
-const EXE = 'C:/Users/靳中轩/AppData/Local/ms-playwright/chromium_headless_shell-1194/chrome-win/headless_shell.exe';
 const OUT = ROOT + '/_audit/pick/';
 fs.mkdirSync(OUT, { recursive: true });
 

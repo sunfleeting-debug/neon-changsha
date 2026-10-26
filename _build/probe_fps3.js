@@ -1,9 +1,7 @@
 /* 稳态帧率：每个视角停 3.2s 再读一次，连读 3 次取中位数。
  * 帧率只读应用自己的 #s-fps —— 外部 rAF 轮询会和应用抢资源，出假读数。
  */
-const { chromium } = require('C:/Users/靳中轩/.workbuddy/binaries/node/workspace/node_modules/playwright-core');
-const ROOT = 'C:/Users/靳中轩/Desktop/neon-changsha';
-const EXE = 'C:/Users/靳中轩/AppData/Local/ms-playwright/chromium_headless_shell-1194/chrome-win/headless_shell.exe';
+const { chromium, ROOT, EXE } = require('./_pw');
 
 const Q = process.argv[2] || 'high';
 const VIEWS = ['cbd', 'all', 'isle'];

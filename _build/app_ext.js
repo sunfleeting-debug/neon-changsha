@@ -27,6 +27,16 @@ renderer.shadowMap.type = THREE.BasicShadowMap;   // 自己采样，只要原始
 renderer.shadowMap.autoUpdate = false;            // 每帧手动置一次，避免水面反射把阴影渲两遍
 app.appendChild(renderer.domElement);
 
+/* ------------------------------------------------------------
+   性能节流开关（2026-10-26 加）
+   本机实测瓶颈是「几何量」而不是像素：1440→720p 只快 35%，再小就不涨了。
+   原因是同一批三角形每帧被画 4 遍 —— 主渲染 1 次 + 2 级阴影 + 水面反射各 1 次。
+   所以省时间的正确做法是「减少整场景渲染的次数」，而不是降分辨率：
+     waterEvery  水面反射每隔几帧才重画一次（反射滞后 1~N 帧，肉眼几乎看不出）
+     shadowEvery 阴影贴图每隔几帧才更新一次（太阳不动，只跟相机走）
+   ============================================================ */
+let frameNo = 0, waterEvery = 1, shadowEvery = 1;
+
 const scene = new THREE.Scene();
 const FOG_D = 0.00021;
 scene.fog = new THREE.FogExp2(0x0c1626, FOG_D);
@@ -126,12 +136,16 @@ const SHADOW = (()=>{
 
   let ready = false;
 
-  function update(){
+  function update(force){
     /* 太阳落到地平线以下就没有阴影可投 */
     if(_sunDir.y < 0.03 || !shadowsWanted){
       uniforms.uShadowOn.value = 0.0;
       return;
     }
+    /* 节流：跳过的这一帧沿用上一帧的深度图，因此**矩阵也必须保持不动**，
+       否则阴影会和深度图错位（会看到整片影子在地上“游”）。
+       换时间/换天气时传 force=true 立刻重算。 */
+    if(shadowEvery > 1 && !force && (frameNo % shadowEvery) !== 0) return;
     camera.updateMatrixWorld();
     const t0 = fit(lights[0], 1, SPLIT);
     const t1 = fit(lights[1], SPLIT*0.7, FAR);
@@ -725,7 +739,10 @@ function buildCity(){
     const y0 = dv.getInt16(p, true)/10; p += 2;
     const tagB = dv.getUint8(p); p += 1;
     const camp = (tagB >> 5) & 3;
-    const func = tagB & 7;
+    /* func 是 5 bit（11 类）。以前这里写的 `& 7` 只取 3 位，
+       历史(9)/校园(10)/在建(8) 全被折叠成住宅/公寓/其他，
+       而 shader 里 `mod(vT,32)` 本来就是按 5 bit 设计的。 */
+    const func = tagB & 31;
 
     const ring = new Array(n);
     for(let k=0;k<n;k++){
@@ -765,14 +782,14 @@ function buildCity(){
       const a = ring[k];
       pos[vo*3] = a[0]; pos[vo*3+1] = y0Fit; pos[vo*3+2] = a[1];
       meta[vo*4] = seed; meta[vo*4+1] = h; meta[vo*4+2] = mode; meta[vo*4+3] = i % TINTS.length;
-      base[vo] = y0Fit; tagA[vo] = camp*8 + func;
+      base[vo] = y0Fit; tagA[vo] = camp*32 + func;
       vo++;
     }
     for(let k=0;k<n;k++){
       const a = ring[k];
       pos[vo*3] = a[0]; pos[vo*3+1] = y0Fit + hFit; pos[vo*3+2] = a[1];
       meta[vo*4] = seed; meta[vo*4+1] = h; meta[vo*4+2] = mode; meta[vo*4+3] = i % TINTS.length;
-      base[vo] = y0Fit; tagA[vo] = camp*8 + func;
+      base[vo] = y0Fit; tagA[vo] = camp*32 + func;
       vo++;
     }
 
@@ -2216,7 +2233,8 @@ const BD = (()=>{
     const n = dv.getUint8(p); p += 1;
     const mode = dv.getUint8(p); p += 1;
     const y0 = dv.getInt16(p,true)/10; p += 2;
-    p += 1;                       // tagB
+    const tagB = dv.getUint8(p); p += 1;
+    const func = tagB & 31;                // 5 bit，和 buildCity 里保持一致
     const pts = new Float32Array(n*2);
     let x0=1e9, x1=-1e9, z0=1e9, z1=-1e9;
     for(let k=0;k<n;k++){
@@ -2225,7 +2243,7 @@ const BD = (()=>{
       if(x<x0)x0=x; if(x>x1)x1=x; if(z<z0)z0=z; if(z>z1)z1=z;
     }
     // 只保留有实际高度的楼（矮棚不挡树，但也会穿模，所以都留）
-    bld.push({ n, pts, x0, x1, z0, z1, h, y0 });
+    bld.push({ n, pts, x0, x1, z0, z1, h, y0, func });
     const i0 = Math.floor(x0/CELL), i1 = Math.floor(x1/CELL);
     const j0 = Math.floor(z0/CELL), j1 = Math.floor(z1/CELL);
     if(i0<mnI)mnI=i0; if(i1>mxI)mxI=i1;
@@ -4146,6 +4164,229 @@ const signBuilt = (()=>{
 })();
 
 /* ============================================================
+   4e. 店面真几何（A2 · 阶段 3 欠账）
+   立面着色器能画「玻璃门面 + 竖挺 + 雨棚暗带」，但走近看是一块平板：
+   没有台阶高差、没有雨棚出挑、没有门套柱的遮挡。
+   这里补的全是「向外凸」的构件 —— 实心墙上没法挖洞，
+   但凸出件的视差、遮挡和自阴影就是「不是平的」的全部证据。
+   尺度按国内商业街：台基 16cm、门头梁底 3.0m、雨棚出挑 1.15m、柱距 ~4m。
+   ============================================================ */
+const SHOP_SPEC = {
+  minH: 10,          // 和立面着色器的店面条件一致（h > 10）
+  maxRoadDist: 12,   // 边中点离道路中心线；再远就不是「街面」了
+  maxEdge: 46,       // 单边最多做多长，超长边只做前段
+  base: 0.16,        // 台基露出高度
+  baseD: 0.36,       // 台基出挑
+  baseSink: 0.55,    // 台基往地下埋多深（坡地上不悬空）
+  segLen: 6.0,       // 台基分段：逐段采样地面，避免一头悬空一头埋掉
+  colW: 0.24,        // 门套柱宽
+  colD: 0.26,        // 门套柱出挑
+  colEvery: 4.2,     // 柱间距
+  headY: 3.00,       // 门头梁底（相对建筑底 y0）
+  headH: 0.56,
+  headD: 0.34,
+  awnY: 3.66,        // 雨棚内缘高度
+  awnD: 1.15,        // 雨棚出挑
+  awnDrop: 0.14,     // 外缘下沉，做出坡度
+  awnTh: 0.075,
+};
+
+const SHOP_COL = {
+  base: '#6a655d',   // 石材台基
+  col:  '#7c766b',   // 门套柱
+  head: '#3b3630',   // 门头梁 / 卷帘箱
+  awn:  ['#8b887f', '#5d6b74', '#7d5a52', '#6d7265', '#8a8577'],
+};
+
+const shopUniforms = {
+  uDay:{value:0}, uSunDir:{value:new THREE.Vector3(0,1,0)},
+  uSunCol:{value:new THREE.Color(1,1,1)}, uSkyAmb:{value:new THREE.Color('#0a1018')},
+  uFogColor:{value:PAL.fog.clone()}, uFogDensity:{value:FOG_D},
+  uNight:{value:0}, uLamp:{value:PAL.lamp.clone()},
+};
+Object.assign(shopUniforms, SHADOW.uniforms);
+Object.assign(shopUniforms, SKYIRR.uniforms);
+
+const shopMat = new THREE.ShaderMaterial({
+  uniforms: shopUniforms,
+  side: THREE.DoubleSide,
+  vertexShader:`
+    attribute vec3 aCol;
+    varying vec3 vC, vW, vN;
+    void main(){
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vW = wp.xyz; vN = normalize(mat3(modelMatrix) * normal); vC = aCol;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }`,
+  fragmentShader:`
+    precision highp float;
+    ${SHADOW_GLSL}
+    ${SKY_GLSL}
+    uniform float uDay, uFogDensity, uNight;
+    uniform vec3 uSunDir, uSunCol, uSkyAmb, uFogColor, uLamp;
+    varying vec3 vC, vW, vN;
+    void main(){
+      vec3 n = normalize(vN);
+      if(dot(n, cameraPosition - vW) < 0.0) n = -n;
+      float ndl = max(dot(n, uSunDir), 0.0);
+      float sh = shadowAt(vW, n);
+      vec3 ambC = mix(uSkyAmb*(0.60 + 0.40*max(n.y, 0.0)), skyIrr(n)*1.02, uDay);
+      vec3 dayC = vC * (uSunCol*ndl*1.08*sh + ambC*1.02);
+      /* 夜里几乎没有自发光：只有环境光 + 路灯从下方打上来的一点暖光，
+         朝下的面（雨棚底面、门头梁底面）吃到更多，这个方向感很关键 */
+      vec3 nightC = vC*(uSkyAmb*0.55) + uLamp*0.030*(1.0 - max(n.y, 0.0))*vC;
+      vec3 col = mix(nightC, dayC, uDay);
+      float d = length(cameraPosition - vW);
+      float f = 1.0 - exp(-uFogDensity*uFogDensity*d*d);
+      gl_FragColor = vec4(mix(col, uFogColor, clamp(f, 0.0, 1.0)), 1.0);
+    }`,
+});
+
+const shopBuilt = (()=>{
+  /* 和招牌同一个理由：构建期屏蔽 UUID 对 Math.random 的消耗 */
+  const _rB = Math.random;
+  Math.random = () => 0.5;
+  try {
+  const G = { P: [], N: [], C: [], I: [], v: 0 };
+  const C_BASE = new THREE.Color(SHOP_COL.base);
+  const C_COL  = new THREE.Color(SHOP_COL.col);
+  const C_HEAD = new THREE.Color(SHOP_COL.head);
+  const AWN = SHOP_COL.awn.map(h => new THREE.Color(h));
+  const col = new THREE.Color();
+
+  function quad(a, b, c, d, nx, ny, nz){
+    const base = G.v;
+    G.P.push(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], d[0], d[1], d[2]);
+    for(let i = 0; i < 4; i++){ G.N.push(nx, ny, nz); G.C.push(col.r, col.g, col.b); }
+    G.I.push(base, base+1, base+2, base, base+2, base+3);
+    G.v += 4;
+  }
+
+  /* 边坐标系里的盒子：su 沿边、sn 向外、y 竖直。skip 里为 true 的面不造
+     （贴墙那一面永远不造：DoubleSide 下从背后看到的就是正面的反面）。 */
+  function boxUVN(ax, az, ux, uz, nx, nz, su0, su1, sn0, sn1, ya, yb, skip){
+    const P = (su, sn, y) => [ax + ux*su + nx*sn, y, az + uz*su + nz*sn];
+    const a00 = P(su0, sn0, ya), a10 = P(su1, sn0, ya);
+    const a01 = P(su0, sn1, ya), a11 = P(su1, sn1, ya);
+    const b00 = P(su0, sn0, yb), b10 = P(su1, sn0, yb);
+    const b01 = P(su0, sn1, yb), b11 = P(su1, sn1, yb);
+    if(!skip || !skip.n)   quad(a01, a11, b11, b01,  nx, 0, nz);
+    if(!skip || !skip.su0) quad(a00, a01, b01, b00, -ux, 0, -uz);
+    if(!skip || !skip.su1) quad(a11, a10, b10, b11,  ux, 0,  uz);
+    if(!skip || !skip.top) quad(b00, b01, b11, b10, 0, 1, 0);
+    if(!skip || !skip.bot) quad(a00, a10, a11, a01, 0, -1, 0);
+  }
+
+  /* 斜板（雨棚）：内缘高 ya0、外缘低 ya1，板厚 th */
+  function slabUVN(ax, az, ux, uz, nx, nz, su0, su1, sn0, sn1, ya0, ya1, th){
+    const P = (su, sn, y) => [ax + ux*su + nx*sn, y, az + uz*su + nz*sn];
+    const t00 = P(su0, sn0, ya0), t10 = P(su1, sn0, ya0);
+    const t01 = P(su0, sn1, ya1), t11 = P(su1, sn1, ya1);
+    const u00 = P(su0, sn0, ya0 - th), u10 = P(su1, sn0, ya0 - th);
+    const u01 = P(su0, sn1, ya1 - th), u11 = P(su1, sn1, ya1 - th);
+    quad(t00, t01, t11, t10, 0, 1, 0);
+    quad(u00, u10, u11, u01, 0, -1, 0);
+    quad(t11, t01, u01, u11, nx, 0, nz);
+    quad(t01, t00, u00, u01, -ux, 0, -uz);
+    quad(t10, t11, u11, u10, ux, 0, uz);
+  }
+
+  let nb = 0;
+  const list = BD.all;
+  for(let bi = 0; bi < list.length; bi++){
+    const b = list[bi];
+    if(b.h < SHOP_SPEC.minH) continue;
+    if(b.n < 3) continue;
+
+    let cx = 0, cz = 0;
+    for(let k = 0; k < b.n; k++){ cx += b.pts[k*2]; cz += b.pts[k*2+1]; }
+    cx /= b.n; cz /= b.n;
+
+    /* 只做评分最高的那一条边（长 × 贴街）；一栋楼一个街面就够 */
+    let best = null, bestScore = 0;
+    for(let ei = 0; ei < b.n; ei++){
+      const ei2 = (ei+1) % b.n;
+      const ax = b.pts[ei*2], az = b.pts[ei*2+1];
+      const bx = b.pts[ei2*2], bz = b.pts[ei2*2+1];
+      const L0 = Math.hypot(bx-ax, bz-az);
+      if(L0 < 7) continue;
+      const mx = (ax+bx)*0.5, mz = (az+bz)*0.5;
+      const rd = RNB.nearest(mx, mz, -1, 0, 1)[0];
+      if(rd > SHOP_SPEC.maxRoadDist) continue;
+      const sc = Math.min(L0, SHOP_SPEC.maxEdge) * (1 + (SHOP_SPEC.maxRoadDist - rd) / SHOP_SPEC.maxRoadDist);
+      if(sc > bestScore){
+        bestScore = sc;
+        const ux = (bx-ax)/L0, uz = (bz-az)/L0;
+        let nx = -uz, nz = ux;
+        if((mx-cx)*nx + (mz-cz)*nz < 0){ nx = -nx; nz = -nz; }
+        best = { ax, az, ux, uz, nx, nz, L: Math.min(L0, SHOP_SPEC.maxEdge) };
+      }
+    }
+    if(!best) continue;
+
+    const ax = best.ax, az = best.az, ux = best.ux, uz = best.uz;
+    const nx = best.nx, nz = best.nz, L = best.L;
+    const y0 = b.y0;
+    const headB = y0 + SHOP_SPEC.headY;
+    const headT = headB + SHOP_SPEC.headH;
+    const awnIn = y0 + SHOP_SPEC.awnY;
+    const awnOut = awnIn - SHOP_SPEC.awnDrop;
+
+    /* ① 台基：逐段采样地面。坡地上必须分段，否则整条平的一头悬空一头埋掉 */
+    const segN = Math.max(1, Math.ceil(L / SHOP_SPEC.segLen));
+    col.copy(C_BASE);
+    for(let s = 0; s < segN; s++){
+      const su0 = L * s / segN, su1 = L * (s + 1) / segN;
+      const mu = (su0 + su1) * 0.5;
+      const gy = terrainAt(ax + ux*mu + nx*0.20, az + uz*mu + nz*0.20);
+      const yTop = gy + SHOP_SPEC.base;
+      boxUVN(ax, az, ux, uz, nx, nz, su0, su1, -0.03, SHOP_SPEC.baseD,
+             yTop - SHOP_SPEC.baseSink, yTop, { bot: true });
+    }
+
+    /* ② 门头梁：整条一根，出挑 34cm —— 从街上看是「店面被压了一道深檐」 */
+    col.copy(C_HEAD);
+    boxUVN(ax, az, ux, uz, nx, nz, 0, L, -0.03, SHOP_SPEC.headD, headB, headT, null);
+
+    /* ③ 雨棚：斜板 + 前缘下折，出挑 1.15m */
+    col.copy(AWN[(bi * 3) % AWN.length]);
+    slabUVN(ax, az, ux, uz, nx, nz, 0.05, L - 0.05,
+            SHOP_SPEC.headD - 0.02, SHOP_SPEC.headD + SHOP_SPEC.awnD - 0.02,
+            awnIn, awnOut, SHOP_SPEC.awnTh);
+
+    /* ④ 门套柱：从台基顶到门头梁底。顶和底都被盖住，只造 3 个立面 */
+    col.copy(C_COL);
+    const colN = Math.max(1, Math.round(L / SHOP_SPEC.colEvery));
+    const hw = SHOP_SPEC.colW * 0.5;
+    for(let ci = 0; ci <= colN; ci++){
+      const su = L * ci / colN;
+      const gy = terrainAt(ax + ux*su + nx*0.12, az + uz*su + nz*0.12);
+      const yb = gy + SHOP_SPEC.base;
+      if(headB - yb < 1.3) continue;
+      boxUVN(ax, az, ux, uz, nx, nz, su - hw, su + hw, -0.03, SHOP_SPEC.colD,
+             yb, headB, { top: true, bot: true });
+    }
+
+    nb++;
+  }
+
+  if(!nb) return { count: 0 };
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(G.P, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(G.N, 3));
+  geo.setAttribute('aCol', new THREE.Float32BufferAttribute(G.C, 3));
+  geo.setIndex(G.I);
+  const mesh = new THREE.Mesh(geo, shopMat);
+  mesh.frustumCulled = false;
+  mesh.name = 'shops';
+  world.add(mesh);
+  return { count: nb, quads: G.v / 4, verts: G.v, tris: G.I.length / 3, mesh };
+  } finally {
+    Math.random = _rB;
+  }
+})();
+
+/* ============================================================
    4b. 湘江大桥（阶段 2）
    OSM 只给桥面走位与长度，塔/拱/索/栏杆/灯柱按 BRIDGE_SPEC 参数化。
    高程：y = max(水面+14, 沿线地形+6)，先做 ±120m 膨胀（否则跨洲段会扎进橘子洲），
@@ -4855,6 +5096,15 @@ water.rotation.x = -Math.PI/2;
 water.position.y = 0;
 world.add(water);
 
+/* 水面反射节流：Reflector 在 onBeforeRender 里把**整个场景再渲一遍**，
+   实测占 GPU 时间的 26~37%（三角形从 6.9M 涨到 13.2M 就是它造成的）。
+   跳过的帧保留上一帧的渲染目标，视觉上只是反射晚 1~N 帧。 */
+const _waterOBR = water.onBeforeRender;
+water.onBeforeRender = function(){
+  if(waterEvery > 1 && (frameNo % waterEvery) !== 0) return;
+  return _waterOBR.apply(this, arguments);
+};
+
 if(WATER_MASK_URL && WATER_MASK_URL.length > 10){
   const tex = new THREE.TextureLoader().load(WATER_MASK_URL, ()=>{
     tex.colorSpace = THREE.NoColorSpace;
@@ -5127,6 +5377,11 @@ function perfFrameStats(){
     const on = signBuilt.meshDeco ? (signBuilt.meshExtra && signBuilt.meshExtra.visible ? 2 : signBuilt.meshDeco.visible ? 1 : 0) : 0;
     lines.push('signs ' + (signBuilt.count / 1000).toFixed(1) + 'k  core/deco/extra ' +
                tc.map(v => (v / 1000).toFixed(1)).join('/') + '  tier ' + on);
+  }
+  if(typeof shopBuilt !== 'undefined' && shopBuilt && shopBuilt.count){
+    lines.push('shops ' + (shopBuilt.count / 1000).toFixed(1) + 'k bld  ' +
+               (shopBuilt.quads / 1000).toFixed(1) + 'k quad  ' +
+               (shopBuilt.tris / 1e3 | 0) + 'k tri');
   }
   lines.push('gpu  ' + (PERF.gpuOk ? (PERF.gpuMs ? PERF.gpuMs.toFixed(2) + 'ms' : 'measuring') : 'n/a (no timer ext)'));
   PERF.el.textContent = lines.join('\n');
@@ -5855,6 +6110,14 @@ function applyTime(hour){
   signUniforms.uNight.value = night;
   signUniforms.uFogColor.value.copy(fog);
   signUniforms.uFogDensity.value = fogD;
+  shopUniforms.uDay.value = day;
+  shopUniforms.uSunDir.value.copy(_sunDir);
+  shopUniforms.uSunCol.value.copy(sun).multiplyScalar(sunI);
+  shopUniforms.uSkyAmb.value.copy(amb);
+  shopUniforms.uFogColor.value.copy(fog);
+  shopUniforms.uFogDensity.value = fogD;
+  shopUniforms.uNight.value = night;
+  shopUniforms.uLamp.value.copy(PAL.lamp);
   bridgeUniforms.uLamp.value.copy(PAL.lamp);
   const wu = water.material.uniforms;
   wu.uHour.value = cityUniforms.uHour.value;
@@ -5943,42 +6206,92 @@ document.querySelectorAll('.chip.wx').forEach(b=>{
   go(TEX.facadeN, (t)=>{ cityUniforms.uFacadeN.value = t; });
 })();
 
-/* ---------- 画质档位 ---------- */
-function applyQuality(mode){
-  qMode = mode;
-  qualityTier = 0;
+/* ---------- 画质档位 ----------
+   2026-10-26 重构：原来四个档位只改「像素比 / 反射分辨率 / 植被密度」，
+   而实测瓶颈是几何量，所以 low 档只快了 16%（155ms → 131ms），等于没救。
+   现在每档除了像素，还会控制「整场景重复渲染的次数」（水面反射/阴影更新频率）
+   和「是否画装饰件」（屋顶设备、招牌叠挂、店面凸出件）。 */
+function detectGpuTier(){
+  try{
+    const gl = renderer.getContext();
+    const ext = gl.getExtension('WEBGL_debug_renderer_info');
+    const s = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : '';
+    /* 核显 / 软件光栅：这套场景（约 440 万三角形、每帧 4 遍全场景）扛不住，
+       一进来就低档，不用等 4 秒采样。见 PROJECT_STATE 的实测数据。 */
+    if(/UHD Graphics|HD Graphics|Iris|Mali-|Adreno|PowerVR|SwiftShader|llvmpipe|Basic Render/i.test(s)) return 'low';
+    if(/RTX|GTX|Radeon RX|Radeon Pro|Apple M\d|Arc A\d/i.test(s)) return 'high';
+    return 'mid';
+  }catch(e){ return 'mid'; }
+}
+
+let curProfile = 'high';
+let curRT = 0.42;
+const PROFILE_RANK = { low: 0, mid: 1, high: 2 };
+
+function setProfile(name){
+  curProfile = name;
   const dpr = Math.min(window.devicePixelRatio || 1, 1.75);
   const setRT = (f)=> water.getRenderTarget().setSize(
     Math.max(256, Math.floor(innerWidth*f)), Math.max(256, Math.floor(innerHeight*f)));
-  let pr = dpr, rt = 0.42, veg = 1.0, crowd = true, road = true;
-  if(mode === 'high'){ pr = dpr;        rt = 0.42; veg = 1.00; qBloomMul = 1.00; qRainOff = false; }
-  else if(mode === 'mid'){ pr = Math.min(dpr,1.25); rt = 0.32; veg = 0.70; qBloomMul = 0.88; qRainOff = false; }
-  else if(mode === 'low'){ pr = 1;      rt = 0.22; veg = 0.42; qBloomMul = 0.62; qRainOff = true; crowd = false; }
-  else { pr = dpr; rt = 0.42; veg = 1.0; qBloomMul = 1.0; qRainOff = false; }
+  let pr = dpr, rt = 0.42, veg = 1.0, crowd = true;
+  let wEvery = 1, sEvery = 1, roofOn = true, bloomOn = true;
+  if(name === 'high'){
+    pr = dpr; rt = 0.42; veg = 1.00; qBloomMul = 1.00; qRainOff = false;
+  } else if(name === 'mid'){
+    pr = Math.min(dpr, 1.0); rt = 0.32; veg = 0.70; qBloomMul = 0.88; qRainOff = false;
+    wEvery = 2; sEvery = 2;                     /* 反射/阴影各隔一帧 */
+  } else {  /* low：低端核显的生存档 */
+    pr = Math.min(dpr, 0.85); rt = 0.16; veg = 0.42; qBloomMul = 0.62; qRainOff = true; crowd = false;
+    /* 泛光保留 —— 它是这套夜景的招牌。它的开销已经在 composer 分辨率里按 pr 缩过了，
+       全关掉画面会从「滨江夜景」变成「一堆黑盒子」，不值。 */
+    wEvery = 6; sEvery = 1; roofOn = false; bloomOn = true;
+  }
+  waterEvery = wEvery; shadowEvery = sEvery; curRT = rt;
   renderer.setPixelRatio(pr); composer.setPixelRatio(pr);
   composer.setSize(innerWidth, innerHeight);
   /* SSAO 跟着档位走：low 直接关掉整条链（预通道也省），high/mid 只改强度 */
-  AO_STRENGTH = mode === 'low' ? 0 : (mode === 'high' ? 0.55 : 0.40);
+  AO_STRENGTH = name === 'low' ? 0 : (name === 'high' ? 0.55 : 0.40);
   aoPass.enabled = AO_STRENGTH > 0;
   if(aoPass.enabled) aoPass.setSize(innerWidth * pr, innerHeight * pr);
   setRT(rt);
   setVegQuality(veg);
-  /* 招牌三级跟着档位走：low 只留街面骨架，mid 加叠挂/竖招，high 全开。
+  /* 招牌三级：low 只留街面骨架，mid 加叠挂/竖招，high 全开。
      core 已经保证了「两侧连排」，砍掉的只是丰富度和巷口背面 —— 观感损失很小。 */
   const signTier = qSignForce >= 0 ? qSignForce
-                 : (mode === 'high' || mode === 'auto') ? 2 : (mode === 'mid' ? 1 : 0);
+                 : (name === 'high' ? 2 : (name === 'mid' ? 1 : 0));
   if(signBuilt){
     if(signBuilt.meshCore)  signBuilt.meshCore.visible  = true;
     if(signBuilt.meshDeco)  signBuilt.meshDeco.visible  = signTier >= 1;
     if(signBuilt.meshExtra) signBuilt.meshExtra.visible = signTier >= 2;
   }
-  const shadowsOn = mode !== 'low';
+  /* 屋顶设备（女儿墙/水箱/空调/太阳能，实测约 90 万三角形 × 4 遍渲染）：
+     low 档不画。远看几乎看不出，近看只是屋顶变干净。 */
+  if(typeof roofMesh !== 'undefined') roofMesh.visible = roofOn;
+  /* 泛光：low 档整条 bloom 链路关掉（5 个全屏 pass） */
+  if(typeof bloom !== 'undefined') bloom.enabled = bloomOn;
+  /* 店面真几何：low 回退到纯着色器店面（着色器那套本来就还在，只是少了凸出件） */
+  if(typeof shopBuilt !== 'undefined' && shopBuilt && shopBuilt.mesh){
+    shopBuilt.mesh.visible = name !== 'low';
+  }
+  const shadowsOn = name !== 'low';
   SHADOW.setEnabled(shadowsOn);
   renderer.shadowMap.enabled = shadowsOn;
   if(typeof shadowMesh !== 'undefined') shadowMesh.visible = !shadowsOn;
   if(typeof crowdOn !== 'undefined') crowdOn = crowd;
   if(typeof trafficGroup !== 'undefined') trafficGroup.visible = crowd;
-  document.querySelectorAll('.chip.q').forEach(b=>b.classList.toggle('on', b.dataset.q === mode));
+}
+
+/* 只允许「往下调」，不做升级 —— 否则弱机从 low 起步会被阶梯判定反过来抬到 mid */
+function wantProfile(next){
+  if(PROFILE_RANK[next] < PROFILE_RANK[curProfile]) setProfile(next);
+}
+
+function applyQuality(mode){
+  qMode = mode;
+  qualityTier = 0;
+  /* auto 先按 GPU 猜一档，之后再按实测帧率往下降 */
+  setProfile(mode === 'auto' ? detectGpuTier() : mode);
+  document.querySelectorAll('.chip.q').forEach(b=>b.classList.toggle('on', b.dataset.q === qMode));
   applyTime(curHour);
 }
 document.querySelectorAll('.chip.q').forEach(b=>{
@@ -6014,7 +6327,9 @@ addEventListener('resize', ()=>{
   camera.aspect = w/h; camera.updateProjectionMatrix();
   renderer.setSize(w,h); composer.setSize(w,h);
   gradePass.uniforms.uRes.value.set(w,h);
-  water.getRenderTarget().setSize(Math.floor(w*0.42), Math.floor(h*0.42));
+  /* 反射目标按当前档位的比例重建（low 是 0.16，别再写死 0.42） */
+  water.getRenderTarget().setSize(
+    Math.max(256, Math.floor(w*curRT)), Math.max(256, Math.floor(h*curRT)));
   if(bloom.setSize) bloom.setSize(w,h);
 });
 
@@ -6065,6 +6380,7 @@ function tick(){
   sky.position.copy(camera.position);
   gradePass.uniforms.uTime.value = elapsed;
 
+  frameNo++;
   SHADOW.update();
   if(PERF_ON){ renderer.info.reset(); perfGpuBegin(); }
   if(!window.__paint){ window.__paint = { first: 0 }; const _r0 = performance.now(); composer.render(); window.__paint.first = Math.round(performance.now() - _r0); }
@@ -6078,31 +6394,30 @@ function tick(){
     const f = frames/fpsT;
     fpsEl.textContent = Math.round(f);
     frames = 0; fpsT = 0;
-    // 三档自适应：像素比 → 反射分辨率 → 关雨
-    if(qMode === 'auto' && elapsed > 4){
-      if(qualityTier === 0 && f < 34){
+    /* 自适应阶梯（2026-10-26 重写）
+       旧版只降像素比 / 反射分辨率 / 关雨，实测收益 16%，等于没救。
+       新版直接换档位：先降到 mid（反射与阴影隔帧），再降到 low（关阴影/泛光/屋顶设备、
+       反射每 6 帧画一次）。用 wantProfile 保证只降不升。 */
+    if(qMode === 'auto' && elapsed > 3.5){
+      if(qualityTier === 0 && f < 40){
         qualityTier = 1;
-        renderer.setPixelRatio(1); composer.setPixelRatio(1);
-        composer.setSize(innerWidth, innerHeight);
-      } else if(qualityTier === 1 && f < 26){
+        wantProfile('mid');
+        bloom.strength *= 0.9;
+      } else if(qualityTier === 1 && f < 28){
         qualityTier = 2;
-        water.getRenderTarget().setSize(
-          Math.max(256, Math.floor(innerWidth*0.30)),
-          Math.max(256, Math.floor(innerHeight*0.30))
-        );
-        bloom.strength *= 0.85;
-        setVegQuality(0.58);
-      } else if(qualityTier === 2 && f < 18){
-        qualityTier = 3;
-        rainOn = false;
+        wantProfile('low');
         setVegQuality(0.30);
-        /* 已经弱到要关雨了，招牌也退到 core：只留街面骨架 + 竖招 */
-        if(qSignForce < 0 && typeof signBuilt !== 'undefined' && signBuilt){
-          if(signBuilt.meshDeco)  signBuilt.meshDeco.visible  = false;
-          if(signBuilt.meshExtra) signBuilt.meshExtra.visible = false;
-        }
+        rainOn = false;
         const chip = document.querySelector('.chip[data-t="rain"]');
         if(chip) chip.classList.remove('on');
+      } else if(qualityTier === 2 && f < 20){
+        /* 兜底：连 low 都跑不动（软件渲染 / 老核显），再砍内部分辨率与植被。
+           0.65 的渲染分辨率在 1440p 窗口上约等于 936×585 再放大 —— 夜景糊一点，
+           但换来的帧率是实打实的。 */
+        qualityTier = 3;
+        renderer.setPixelRatio(0.65); composer.setPixelRatio(0.65);
+        composer.setSize(innerWidth, innerHeight);
+        setVegQuality(0.18);
       }
     }
   }
@@ -6119,7 +6434,7 @@ window.__dbg = { scene, camera, water, cityMesh, roadMesh, flyTo, HOME, setTour,
   getMode: ()=> mode, applyTime, getHour: ()=> curHour, setWeather: (w)=>{ weather = w; applyTime(curHour); }, bloom, terrainAt, TERR, controls, now:()=>elapsed,
   setTime:(t)=>{ elapsed = t; },   /* 仅供回归截图：冻结时钟后把 elapsed 钉到固定值 */
   veg: ()=> vegBuilt, vegUniforms, vegShadowUniforms, VP, RNB, roadsBuilt, roofMesh, getRoofV: ()=> roofVCount, roofOverflow, carMesh, lampMesh, carArr, lampArr, trafficMesh, trafficMeshes, trafficGroup, TRAFFIC, pedMesh, bikeMesh, WALK,
-  renderer, composer, OCC, BD, isWater, addV, WATM, SHADOW, SKYIRR, BRIDGE_STATS, BRIDGE_DEBUG, SIGNS: signBuilt, getBankLights: ()=> BANK_LIGHTS,
+  renderer, composer, OCC, BD, isWater, addV, WATM, SHADOW, SKYIRR, BRIDGE_STATS, BRIDGE_DEBUG, SIGNS: signBuilt, SHOPS: shopBuilt, getBankLights: ()=> BANK_LIGHTS,
   stats: ()=> ({ calls: renderer.info.render.calls, tris: renderer.info.render.triangles,
                  programs: renderer.info.programs.length, textures: renderer.info.memory.textures,
                  geometries: renderer.info.memory.geometries,
